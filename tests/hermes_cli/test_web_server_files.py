@@ -1,5 +1,6 @@
 """Tests for the dashboard-managed file browser API."""
 
+import gzip
 from types import SimpleNamespace
 
 import pytest
@@ -263,6 +264,171 @@ def test_stream_upload_cleans_temp_on_cancellation(forced_files_client):
     # ... and no .upload temp file was left behind.
     leftovers = [p.name for p in target.parent.iterdir() if ".upload" in p.name]
     assert leftovers == [], f"temp upload files leaked on cancellation: {leftovers}"
+
+
+def test_stream_upload_decompresses_transport_gzip(forced_files_client):
+    """decompress=1 + original_size restores the original bytes under the
+    original name — the .gz never reaches the managed files tree."""
+    client, root = forced_files_client
+    original = b"THE FULL ORIGINAL CONTENT OF A LARGE FILE " * 100
+    target = root / ".hermes-chat-attachments" / "1234_report.pdf"
+    gz_bytes = gzip.compress(original)
+
+    res = client.post(
+        "/api/files/upload-stream",
+        files={"file": ("1234_report.pdf.gz", gz_bytes, "application/gzip")},
+        data={
+            "path": str(target),
+            "overwrite": "true",
+            "decompress": "1",
+            "original_size": str(len(original)),
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert target.read_bytes() == original
+    entry = res.json()["entry"]
+    assert entry["name"] == "1234_report.pdf"
+    assert entry["size"] == len(original)
+
+
+def test_stream_upload_gzip_untouched_without_flag(forced_files_client):
+    """Without decompress=1 a .gz upload stays gzip — a user genuinely
+    attaching a gzip archive must not have it silently expanded."""
+    client, root = forced_files_client
+    original = b"content " * 50
+    gz_bytes = gzip.compress(original)
+    target = root / "out" / "data.gz"
+
+    res = client.post(
+        "/api/files/upload-stream",
+        files={"file": ("data.gz", gz_bytes, "application/gzip")},
+        data={"path": str(target), "overwrite": "true"},
+    )
+    assert res.status_code == 200, res.text
+    assert target.read_bytes() == gz_bytes
+
+
+def test_stream_upload_decompress_flag_non_gzip_stored_raw(forced_files_client):
+    """decompress=1 on non-gzip bytes is a hint, not a contract — content
+    without the gzip magic is stored as-is instead of erroring."""
+    client, root = forced_files_client
+    raw = b"plain bytes, not gzip"
+    target = root / "out" / "plain.txt"
+
+    res = client.post(
+        "/api/files/upload-stream",
+        files={"file": ("plain.txt", raw, "text/plain")},
+        data={"path": str(target), "overwrite": "true", "decompress": "1"},
+    )
+    assert res.status_code == 200, res.text
+    assert target.read_bytes() == raw
+
+
+def test_decompress_gzip_to_enforces_cap(tmp_path):
+    """Decompression is bounded by max_bytes so a tiny upload can't expand
+    into a disk-filling bomb."""
+    from hermes_cli.web_server import _decompress_gzip_to
+
+    src = tmp_path / "in.gz"
+    dst = tmp_path / "out.bin"
+    src.write_bytes(gzip.compress(b"B" * 5000))
+
+    with pytest.raises(Exception) as ei:
+        _decompress_gzip_to(src, dst, max_bytes=100)
+    assert ei.value.status_code == 413
+    assert not dst.exists()
+
+
+def test_decompress_gzip_to_rejects_corrupt(tmp_path):
+    """Truncated/corrupt gzip surfaces as a 400 and never leaves a partial
+    file behind."""
+    from hermes_cli.web_server import _decompress_gzip_to
+
+    src = tmp_path / "in.gz"
+    dst = tmp_path / "out.bin"
+    src.write_bytes(b"\x1f\x8b" + b"not real gzip data")
+
+    with pytest.raises(Exception) as ei:
+        _decompress_gzip_to(src, dst, max_bytes=1000)
+    assert ei.value.status_code == 400
+    assert not dst.exists()
+
+
+# ---------------------------------------------------------------------------
+# Legacy base64 upload (/api/files/upload) — transport decompression parity
+# ---------------------------------------------------------------------------
+
+
+def _b64(data: bytes) -> str:
+    """Encode bytes as a data-URL string for the ManagedFileUpload payload."""
+    import base64
+    return f"data:application/octet-stream;base64,{base64.b64encode(data).decode()}"
+
+
+def test_legacy_upload_decompresses_transport_gzip(forced_files_client):
+    """decompress=1 + original_size on the legacy base64 endpoint restores
+    the original bytes, matching the stream endpoint's behaviour."""
+    client, root = forced_files_client
+    original = b"LEGACY ENDPOINT ORIGINAL CONTENT " * 200
+    target = root / ".hermes-chat-attachments" / "5678_data.csv"
+    gz_bytes = gzip.compress(original)
+
+    res = client.post(
+        "/api/files/upload",
+        json={
+            "path": str(target),
+            "data_url": _b64(gz_bytes),
+            "overwrite": True,
+            "decompress": True,
+            "original_size": len(original),
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert target.exists()
+    assert target.read_bytes() == original
+    entry = res.json()["entry"]
+    assert entry["name"] == "5678_data.csv"
+    assert entry["size"] == len(original)
+
+
+def test_legacy_upload_gzip_untouched_without_flag(forced_files_client):
+    """Without decompress=1 the legacy endpoint stores the raw bytes
+    (a user genuinely uploading a .gz archive)."""
+    client, root = forced_files_client
+    original = b"NOT GZIP CONTENT " * 50
+    target = root / ".hermes-chat-attachments" / "raw.gz"
+
+    res = client.post(
+        "/api/files/upload",
+        json={
+            "path": str(target),
+            "data_url": _b64(original),
+            "overwrite": True,
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert target.read_bytes() == original
+
+
+def test_legacy_upload_decompress_flag_non_gzip_stored_raw(forced_files_client):
+    """decompress=1 on non-gzip bytes stores them as-is — the magic check
+    decides, not the flag."""
+    client, root = forced_files_client
+    raw = b"PLAIN TEXT NOT GZIP AT ALL " * 30
+    target = root / ".hermes-chat-attachments" / "notgz.bin"
+
+    res = client.post(
+        "/api/files/upload",
+        json={
+            "path": str(target),
+            "data_url": _b64(raw),
+            "overwrite": True,
+            "decompress": True,
+            "original_size": len(raw),
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert target.read_bytes() == raw
 
 
 def test_sensitive_env_files_hidden_from_listing(forced_files_client):

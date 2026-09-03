@@ -1214,7 +1214,7 @@ class SessionDB(
     # ── Message storage constants (SessionMessagesMixin) ──
     # Prefix marking JSON-encoded structured content; NUL cannot collide with text.
     _CONTENT_JSON_PREFIX = "\x00json:"
-    #: Reactions live inside ``display_metadata`` so they survive row rewrites.
+#: Reactions live inside ``display_metadata`` so they survive row rewrites.
     REACTIONS_METADATA_KEY = "reactions"
     # Columns every conversation projection decodes; ``active`` rides along so a display read
     # can split compaction-archived rows without a second query.

@@ -76,6 +76,12 @@ class ManagedFileUpload(BaseModel):
     path: str
     data_url: str
     overwrite: bool = True
+    # Transport-only compression: when ``decompress`` is true and the decoded
+    # bytes start with the gzip magic (\x1f\x8b), stream-decompress them into
+    # the target so the stored file is the original content under the original
+    # name.  ``original_size`` bounds the decompression-bomb expansion.
+    decompress: bool = False
+    original_size: int = 0
 
 class ChatImageUpload(BaseModel):
     data_url: str

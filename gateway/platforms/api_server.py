@@ -17,8 +17,10 @@ from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from functools import wraps
 import logging
+import mimetypes
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import threading
@@ -121,7 +123,13 @@ from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.base import (
-    MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, is_network_accessible, validate_media_delivery_path)
+    MEDIA_EXTENSIONLESS_TAG_RE,
+    MEDIA_TAG_CLEANUP_RE,
+    BasePlatformAdapter,
+    SendResult,
+    is_network_accessible,
+    validate_media_delivery_path,
+)
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
@@ -865,6 +873,167 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
     except Exception:
         return text
+
+
+# Directory (under the managed files root) where agent-produced deliverables
+# are copied so the dashboard can serve them with its existing
+# ``/api/files/download`` endpoint. Mirrors the frontend's own upload
+# destination (``<root>/.hermes-chat-attachments``) so user uploads and agent
+# results live side by side and both resolve under the same managed root.
+_AGENT_DELIVERABLES_SUBDIR = ".hermes-chat-attachments"
+_AGENT_DELIVERABLE_MAX_BYTES = 100 * 1024 * 1024
+
+
+def _agent_managed_files_root() -> Optional[Path]:
+    """Return the dashboard's managed-files root for copying produced files.
+
+    Mirrors ``hermes_cli.web_server._managed_files_policy`` so the gateway
+    writes into the same tree the dashboard's ``/api/files/download`` serves:
+    ``HERMES_DASHBOARD_FILES_ROOT`` wins, then the hosted ``/opt/data`` layout
+    (when HERMES_HOME resolves there), else the home directory. Returns None
+    when the root cannot be determined (copying is then skipped — the SSE
+    stream still emits the original path, which local installs can serve).
+    """
+    raw = os.environ.get("HERMES_DASHBOARD_FILES_ROOT", "").strip()
+    if raw:
+        try:
+            return Path(raw).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return None
+    try:
+        from hermes_constants import get_default_hermes_root
+        root = get_default_hermes_root().expanduser().resolve(strict=False)
+        if root == Path("/opt/data").resolve():
+            return root
+    except (OSError, RuntimeError, ValueError, ImportError):
+        pass
+    try:
+        return Path.home()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _sanitize_deliverable_name(name: str) -> str:
+    """Filesystem-safe basename for a copied agent deliverable.
+
+    Strips path separators, traversal, and control/illegal characters — the
+    same sanitizer the frontend applies to user uploads, so copy targets and
+    browser-provided filenames stay consistent.
+    """
+    clean = (
+        str(name or "")
+        .replace("\\", "_")
+        .replace("/", "_")
+        .replace("..", "")
+        .replace("\x00", "_")
+        .replace("\n", "_")
+        .replace("\r", "_")
+        .strip()
+    )
+    return clean or "attachment"
+
+
+def _collect_produced_files(final_response: str, turn_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Find files the agent produced this turn and copy them under the
+    managed files root so the dashboard can stream them as downloads.
+
+    Produced files surface as ``MEDIA:<path>`` tags — either appended by the
+    gateway's auto-append machinery (image_generate, text_to_speech, ...) or
+    emitted by the model itself in its final reply. We scan the RAW final
+    response (before ``_resolve_media_to_data_urls`` inlines images) plus the
+    turn's tool-role results, validate each path with the same
+    ``validate_media_delivery_path`` safety check the platform delivery
+    pipeline uses, dedupe, and copy survivors into
+    ``<managed root>/.hermes-chat-attachments/<timestamp>_<name>``.
+
+    Returns a list of attachment descriptors ``{name, path, size, mime_type}``
+    where ``path`` is the ABSOLUTE copy location the dashboard can serve.
+    Best-effort: unreadable / missing / oversized / denylisted paths are
+    skipped (the tag stays in the content for other transports).
+    """
+    candidates: List[str] = []
+    seen: set = set()
+
+    def _add(tag_path: str) -> None:
+        safe = validate_media_delivery_path(tag_path)
+        if not safe or safe in seen:
+            return
+        seen.add(safe)
+        candidates.append(safe)
+
+    def _scan(text: str) -> None:
+        if not text or "MEDIA:" not in text:
+            return
+        for m in MEDIA_TAG_CLEANUP_RE.finditer(text):
+            _add(m.group("path"))
+        for m in MEDIA_EXTENSIONLESS_TAG_RE.finditer(text):
+            _add(m.group("path"))
+
+    _scan(final_response or "")
+    for msg in turn_messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role in ("tool", "function"):
+            _scan(str(msg.get("content") or ""))
+
+    if not candidates:
+        return []
+
+    root = _agent_managed_files_root()
+    if root is None:
+        return []
+    out: List[Dict[str, Any]] = []
+    copied: set = set()
+    for src in candidates:
+        p = Path(src)
+        try:
+            if not p.is_file():
+                continue
+            size = p.stat().st_size
+            if size > _AGENT_DELIVERABLE_MAX_BYTES:
+                continue
+            name = _sanitize_deliverable_name(p.name)
+            target = (
+                root
+                / _AGENT_DELIVERABLES_SUBDIR
+                / f"{int(time.time() * 1000)}_{name}"
+            )
+            if str(target) in copied:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, target)
+            copied.add(str(target))
+            mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+            out.append({
+                "name": p.name,
+                "path": str(target),
+                "size": size,
+                "mime_type": mime,
+            })
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return out
+
+
+def _strip_media_tags_from_response(text: str) -> str:
+    """Remove ``MEDIA:<path>`` tags from content the frontend renders.
+
+    The dashboard turns produced files into downloadable attachment chips, so
+    the literal ``MEDIA:<path>`` tags the agent/auto-append embed in the reply
+    are noise in the bubble — strip both the extension-anchored and
+    extensionless forms after the produced files have been collected and
+    copied (see ``_collect_produced_files``). Best-effort; malformed input is
+    returned untouched.
+    """
+    if not text or "MEDIA:" not in text:
+        return text
+    try:
+        text = MEDIA_TAG_CLEANUP_RE.sub("", text)
+        text = MEDIA_EXTENSIONLESS_TAG_RE.sub("", text)
+    except Exception:
+        return text
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
@@ -3145,15 +3314,51 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     conversation_history=history, stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress, active_run_id=run_id, **ctx["run_kwargs"])
                 is_dict = isinstance(result, dict)
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
-                effective_session_id = result.get("session_id", session_id) if is_dict else session_id
+                raw_final_response = result.get("final_response", "") if is_dict else ""
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if is_dict else []
+                # Files the agent produced this turn (MEDIA: tags in the raw
+                # final response + this turn's tool results). Copied under the
+                # managed files root so the dashboard's /api/files/download can
+                # stream them; emitted as `attachments` on the completion
+                # events so the bubble renders download chips, and persisted
+                # onto the turn's assistant message(s) so restores show them.
+                produced_attachments = _collect_produced_files(raw_final_response, turn_messages)
+                final_response = _strip_media_tags_from_response(
+                    _resolve_media_to_data_urls(raw_final_response))
+                effective_session_id = result.get("session_id", session_id) if is_dict else session_id
                 effective_runtime = self._effective_turn_runtime(runtime_request, result, usage)
+                # Persist the produced-file attachments onto the turn's
+                # assistant message(s) so restored sessions render the same
+                # download chips (best-effort).
+                if produced_attachments:
+                    try:
+                        db = await self._ensure_session_db_async()
+                        if db is not None:
+                            sid = db.resolve_session_id(effective_session_id) or effective_session_id
+                            mids = [
+                                m.get("id") for m in turn_messages
+                                if m.get("role") == "assistant" and m.get("id") is not None
+                            ]
+                            for mid in mids:
+                                await asyncio.to_thread(
+                                    db.set_message_attachments,
+                                    sid,
+                                    mid,
+                                    produced_attachments,
+                                )
+                    except Exception:
+                        logger.debug("[api_server] produced-attachment persist skipped", exc_info=True)
+                    # Stamp onto the emitted transcript so a dashboard that
+                    # joined mid-stream sees the chips immediately.
+                    for m in turn_messages:
+                        if m.get("role") == "assistant":
+                            m["attachments"] = produced_attachments
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
                     "content": final_response, "completed": True,
                     "partial": bool(result.get("partial")) if is_dict else False,
-                    "interrupted": False, "runtime": effective_runtime}))
+                    "interrupted": False, "runtime": effective_runtime,
+                    "attachments": produced_attachments}))
                 # A steer accepted after the final reply lands in result["pending_steer"]; surface
                 # it so clients can replay it rather than lose it.
                 pending_steer = result.get("pending_steer") if is_dict else None

@@ -9,6 +9,11 @@ Usage: ``python -m hermes_cli.main web [--port 8080]``.
 from contextlib import asynccontextmanager
 
 import asyncio
+import atexit
+import base64
+import binascii
+import concurrent.futures
+import gzip
 from collections import deque
 import hmac
 import logging
@@ -387,7 +392,20 @@ def _has_valid_session_token(request: Request) -> bool:
     if session_header and hmac.compare_digest(session_header.encode(), _SESSION_TOKEN.encode()):
         return True
     auth = request.headers.get("authorization", "")
-    return hmac.compare_digest(auth.encode(), f"Bearer {_SESSION_TOKEN}".encode())
+    expected = f"Bearer {_SESSION_TOKEN}"
+    if hmac.compare_digest(auth.encode(), expected.encode()):
+        return True
+
+    # Stash OS: the frontend authenticates dashboard API calls with the same
+    # ``API_SERVER_KEY`` bearer it uses for the gateway (:8642). Accept that
+    # key here too so deployed (tunnel/Vercel) dashboards work without a
+    # loopback-scraped session token.
+    api_key = os.environ.get("API_SERVER_KEY", "").strip()
+    if api_key:
+        expected_api = f"Bearer {api_key}"
+        if hmac.compare_digest(auth.encode(), expected_api.encode()):
+            return True
+    return False
 
 
 # Routes that may also authenticate via ``?token=`` (download links opened by

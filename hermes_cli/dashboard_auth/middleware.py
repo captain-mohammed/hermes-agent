@@ -154,6 +154,20 @@ async def gated_auth_middleware(
     # route): not a cookie session, must not bounce to /login.
     if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
         return await call_next(request)
+    # Stash OS: the frontend authenticates dashboard API calls with the same
+    # ``API_SERVER_KEY`` bearer it uses for the gateway (:8642). Accept it as a
+    # machine credential here so a publicly exposed (tunnel/Vercel) dashboard
+    # works without a browser login round-trip.
+    import os as _os
+    import hmac as _hmac
+
+    _api_key = _os.environ.get("API_SERVER_KEY", "").strip()
+    if _api_key:
+        _bearer = _extract_bearer(request)
+        if _bearer and _hmac.compare_digest(_bearer.encode(), _api_key.encode()):
+            request.state.token_authenticated = True
+            return await call_next(request)
+
     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow
     # stores, verified with the same provider stack, no cookie read or set. A presented-but-
     # invalid bearer gets the structured 401 so the desktop refreshes/re-logs instead of
