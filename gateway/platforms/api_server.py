@@ -3353,6 +3353,38 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     for m in turn_messages:
                         if m.get("role") == "assistant":
                             m["attachments"] = produced_attachments
+                # Persist the per-run token usage breakdown (input/output/cache/
+                # reasoning + cost) onto the turn's assistant message row(s) so
+                # restored sessions show the full usage, not just token_count
+                # (best-effort, same lifecycle as the attachments persist).
+                if isinstance(usage, dict) and any(
+                    usage.get(k)
+                    for k in ("input_tokens", "output_tokens", "cache_read_tokens",
+                              "cache_write_tokens", "reasoning_tokens",
+                              "estimated_cost_usd", "total_tokens")
+                ):
+                    try:
+                        db = await self._ensure_session_db_async()
+                        if db is not None:
+                            sid = db.resolve_session_id(effective_session_id) or effective_session_id
+                            mids = [
+                                m.get("id") for m in turn_messages
+                                if m.get("role") == "assistant" and m.get("id") is not None
+                            ]
+                            for mid in mids:
+                                await asyncio.to_thread(
+                                    db.set_message_usage,
+                                    sid,
+                                    mid,
+                                    usage,
+                                )
+                    except Exception:
+                        logger.debug("[api_server] per-message usage persist skipped", exc_info=True)
+                    # Stamp onto the emitted transcript so a dashboard that
+                    # joined mid-stream sees the breakdown immediately.
+                    for m in turn_messages:
+                        if m.get("role") == "assistant":
+                            m["usage"] = usage
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
                     "content": final_response, "completed": True,
@@ -3804,7 +3836,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Attach usage, effective session id, ``_compressed`` and runtime metadata to a finished turn."""
         usage = {"input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                  "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0}
+                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                 # Extended per-run breakdown so clients (and the persisted
+                 # per-message usage) get the full picture: prompt caching,
+                 # reasoning/thinking tokens, and the estimated cost.
+                 "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
+                 "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
+                 "reasoning_tokens": getattr(agent, "session_reasoning_tokens", 0) or 0,
+                 "estimated_cost_usd": getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0}
         # Effective session id lets callers track compression-triggered rotations.
         # (#16938)
         _eff_sid = getattr(agent, "session_id", session_id)

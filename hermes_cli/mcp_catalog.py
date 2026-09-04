@@ -408,8 +408,16 @@ def _expand_install_dir(value: str, install_dir: Optional[Path]) -> str:
     return value.replace(_INSTALL_DIR_VAR, str(install_dir))
 
 
-def _prompt_env_vars(specs: List[EnvVarSpec]) -> Dict[str, str]:
-    """Prompt for each env spec; secrets and non-secrets alike go to ~/.hermes/.env."""
+def _prompt_env_vars(
+    specs: List[EnvVarSpec], *, non_interactive: bool = False
+) -> Dict[str, str]:
+    """Walk the env spec list, prompting the user for each. Writes secrets and
+    non-secrets alike to ~/.hermes/.env via save_env_value().
+
+    With ``non_interactive`` (web installs — no stdin user), never prompt:
+    reuse anything already in .env, raise for a missing required var, and
+    silently skip optional ones.
+    """
     collected: Dict[str, str] = {}
     for spec in specs:
         existing = get_env_value(spec.name)
@@ -417,12 +425,21 @@ def _prompt_env_vars(specs: List[EnvVarSpec]) -> Dict[str, str]:
             _say(f"  ✓ {spec.name} already set in .env")
             collected[spec.name] = existing
             continue
-        value = _prompt_input(spec.prompt, default=spec.default or None, password=spec.secret)
-        if value:
-            save_env_value(spec.name, value)
-            collected[spec.name] = value
-        elif spec.required:
-            raise CatalogError(f"{spec.name} is required but no value was provided")
+        if non_interactive:
+            if spec.required:
+                raise CatalogError(f"{spec.name} is required but no value was provided")
+            continue
+        value = _prompt_input(
+            spec.prompt,
+            default=spec.default or None,
+            password=spec.secret,
+        )
+        if not value:
+            if spec.required:
+                raise CatalogError(f"{spec.name} is required but no value was provided")
+            continue
+        save_env_value(spec.name, value)
+        collected[spec.name] = value
     return collected
 
 
@@ -504,7 +521,9 @@ def _apply_tool_selection(
     entry: CatalogEntry,
     *,
     prior_selection: Optional[List[str]],
-    prior_exclude: Optional[List[str]] = None) -> None:
+    prior_exclude: Optional[List[str]] = None,
+    non_interactive: bool = False,
+) -> None:
     """Probe the server and let the user pick which tools to enable.
 
     Probe-success: curses checklist; pre-check priority *prior_selection* (reinstall) > manifest
@@ -566,13 +585,18 @@ def _apply_tool_selection(
 
     tool_names = [t[0] for t in probed]
 
-    # Non-TTY: skip the checklist; same priority as the interactive pre-check.
+    # Non-TTY (or a web/API install, which has no human at the terminal):
+    # skip the curses checklist entirely. Priority matches the interactive
+    # pre-check: prior user selection > manifest default > all-on.
     import sys as _sys
-    if not _sys.stdin.isatty():
-        preferred = prior_selection if prior_selection is not None else (entry.tools.default_enabled or None)
-        _write_tools_filter(
-            name, "include", None if preferred is None else [n for n in preferred if n in tool_names]
-        )
+    if non_interactive or not _sys.stdin.isatty():
+        if prior_selection is not None:
+            include = [n for n in prior_selection if n in tool_names]
+        elif entry.tools.default_enabled:
+            include = [n for n in entry.tools.default_enabled if n in tool_names]
+        else:
+            include = None
+        _write_tools_filter(name, "include", include)
         return
 
     pre_set = {n for n in (prior_selection or entry.tools.default_enabled or tool_names) if n in tool_names}
@@ -604,7 +628,9 @@ def _apply_tool_selection(
     _say(f"  ✓ {len(chosen_names)}/{len(probed)} tools enabled.")
 
 
-def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
+def install_entry(
+    entry: CatalogEntry, *, enable: bool = True, non_interactive: bool = False
+) -> None:
     """Install a catalog entry end-to-end.
 
     Order: git clone + bootstrap (if any); API-key prompt to .env or the ``auth: oauth`` marker;
@@ -624,7 +650,7 @@ def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
     if entry.auth.type == "api_key":
         print()
         _say("  Configure credentials:", Colors.CYAN)
-        _prompt_env_vars(entry.auth.env)
+        _prompt_env_vars(entry.auth.env, non_interactive=non_interactive)
     elif entry.auth.type == "oauth" and entry.auth.provider:
         # Provider-mediated OAuth relies on the existing `hermes auth <provider>` flow; surface
         # guidance rather than auto-running it to keep install decoupled from provider-auth lifecycle.
@@ -652,6 +678,13 @@ def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
         raise CatalogError(f"catalog entry '{entry.name}' rejected: suspicious command/args configuration")
 
     _apply_tool_selection(entry, prior_selection=prior_selection, prior_exclude=prior_exclude)
+    # ── Probe + tool selection ──────────────────────────────────────────
+    _apply_tool_selection(
+        entry,
+        prior_selection=prior_selection,
+        prior_exclude=prior_exclude,
+        non_interactive=non_interactive,
+    )
 
     print()
     _say(

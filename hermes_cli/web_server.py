@@ -365,15 +365,51 @@ _DASHBOARD_EMBEDDED_CHAT_ENABLED = True
 # uvicorn's 16 MiB default rejects files under the 256 MiB raw attach cap.
 _DESKTOP_ATTACHMENT_WS_MAX_BYTES = 384 * 1024 * 1024
 
+# Simple rate limiter for the reveal endpoint
+_reveal_timestamps: List[float] = []
+_REVEAL_MAX_PER_WINDOW = 5
+_REVEAL_WINDOW_SECONDS = 30
 
-# CORS: localhost origins only — allow_origins=["*"] on 0.0.0.0 would let any
-# website read/modify config and secrets.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS: restrict to localhost origins only by default.  The web UI is
+# intended to run locally; binding to 0.0.0.0 with allow_origins=["*"]
+# would let any website read/modify config and secrets.
+#
+# Stash OS: when the dashboard is exposed through a public tunnel and driven
+# by the hosted (Vercel) frontend, the browser needs an explicit allow for
+# that origin — the same situation the gateway solves with
+# API_SERVER_CORS_ORIGINS. Mirror it here: HERMES_DASHBOARD_CORS_ORIGINS is a
+# comma-separated list of extra origins (or "*" to allow any origin; every
+# request still has to pass the bearer/ticket auth gate, so a bare "*" only
+# relaxes the browser CORS wall, not authentication).
+_DASHBOARD_CORS_EXTRA = [
+    _origin.strip()
+    for _origin in os.environ.get("HERMES_DASHBOARD_CORS_ORIGINS", "").split(",")
+    if _origin.strip()
+]
+# ``HERMES_DASHBOARD_CORS_ORIGINS=*`` is the operator's explicit "public
+# tunneled deployment" opt-in (the hosted/Vercel frontend + quick tunnels,
+# whose hostnames rotate every restart). It relaxes BOTH browser-CORS walls
+# below: wildcard ACAO *and* the Host-header guard (see
+# ``_is_accepted_host``), so requests from the public tunnel reach the auth
+# gate. Every request must still pass bearer/ticket auth — relaxing these two
+# layers never bypasses authentication, exactly like the gateway's
+# ``API_SERVER_CORS_ORIGINS=*`` stance.
+_DASHBOARD_PUBLIC_TUNNEL_MODE = "*" in _DASHBOARD_CORS_EXTRA
+if "*" in _DASHBOARD_CORS_EXTRA:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        allow_origins=_DASHBOARD_CORS_EXTRA,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Endpoints that do NOT require the session token; everything else under /api/
 # is gated below. Shared with the OAuth gate so the two allowlists cannot
@@ -556,6 +592,15 @@ def _is_accepted_host(
     host_only = _host_header_hostname(host_header)
     if not host_only:
         return False
+
+    # Stash OS: public-tunnel mode (HERMES_DASHBOARD_CORS_ORIGINS=*). Quick
+    # tunnel hostnames rotate on every restart and can't be listed ahead of
+    # time, so accept any Host — auth still gates every API request, and this
+    # mirrors the 0.0.0.0-bind stance ("rely on operator network controls")
+    # for the public-tunnel case.
+    if _DASHBOARD_PUBLIC_TUNNEL_MODE:
+        return True
+
     # All-interfaces bind: no Host-layer defence is possible; rely on operator
     # network controls.
     if host_only in trusted_public_hosts or bound_host in {"0.0.0.0", "::"}:

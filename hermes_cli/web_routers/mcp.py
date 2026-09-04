@@ -439,10 +439,14 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
             raise HTTPException(status_code=500, detail=f"Install failed: {exc}")
         return {"ok": True, "name": name, "background": True, "action": action}
 
-    # No git step — install synchronously; install_entry goes through the
-    # call-time config/env resolvers so the profile scope covers it.
+    # No git step — install synchronously via the catalog API. install_entry
+    # routes through load_config/save_config + save_env_value, all call-time
+    # resolvers, so scoped_to_thread's context override covers it.
+    # non_interactive=True: a web install has no human at the terminal — a
+    # successful probe must NOT drop into the curses tool-selection checklist
+    # (which would block forever on stdin).
     try:
-        await scoped_to_thread(effective_profile, lambda: mcp_catalog.install_entry(entry, enable=body.enable))
+        await scoped_to_thread(effective_profile, lambda: mcp_catalog.install_entry(entry, enable=body.enable, non_interactive=True))
     except HTTPException:
         raise
     except Exception as exc:
