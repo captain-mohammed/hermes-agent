@@ -465,13 +465,20 @@ def _expand_install_dir(value: str, install_dir: Optional[Path]) -> str:
     return value.replace(_INSTALL_DIR_VAR, str(install_dir))
 
 
-def _prompt_env_vars(specs: List[EnvVarSpec], preloaded: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def _prompt_env_vars(
+    specs: List[EnvVarSpec], preloaded: Optional[Dict[str, str]] = None, *,
+    non_interactive: bool = False,
+) -> Dict[str, str]:
     """Prompt for each env spec.
 
     Secrets persist to ~/.hermes/.env. Non-secrets are only collected and
     returned — the caller inlines them into the server config (config.yaml),
     since .env is secrets-only. Values already supplied by the caller
     (``preloaded``, e.g. from a dashboard form) skip the prompt.
+
+    With ``non_interactive`` (web installs — no stdin user), never prompt:
+    reuse anything already in .env, raise for a missing required var, and
+    silently skip optional ones.
     """
     preloaded = preloaded or {}
     collected: Dict[str, str] = {}
@@ -485,13 +492,22 @@ def _prompt_env_vars(specs: List[EnvVarSpec], preloaded: Optional[Dict[str, str]
             _say(f"  ✓ {spec.name} already set in .env")
             collected[spec.name] = existing
             continue
-        value = _prompt_input(spec.prompt, default=spec.default or None, password=spec.secret)
-        if value:
-            if spec.secret:
-                save_env_value(spec.name, value)
-            collected[spec.name] = value
-        elif spec.required:
-            raise CatalogError(f"{spec.name} is required but no value was provided")
+        if non_interactive:
+            if spec.required:
+                raise CatalogError(f"{spec.name} is required but no value was provided")
+            continue
+        value = _prompt_input(
+            spec.prompt,
+            default=spec.default or None,
+            password=spec.secret,
+        )
+        if not value:
+            if spec.required:
+                raise CatalogError(f"{spec.name} is required but no value was provided")
+            continue
+        if spec.secret:
+            save_env_value(spec.name, value)
+        collected[spec.name] = value
     return collected
 
 
@@ -591,7 +607,9 @@ def _apply_tool_selection(
     entry: CatalogEntry,
     *,
     prior_selection: Optional[List[str]],
-    prior_exclude: Optional[List[str]] = None) -> None:
+    prior_exclude: Optional[List[str]] = None,
+    non_interactive: bool = False,
+) -> None:
     """Probe the server and let the user pick which tools to enable.
 
     Probe-success: curses checklist; pre-check priority *prior_selection* (reinstall) > manifest
@@ -655,13 +673,18 @@ def _apply_tool_selection(
 
     tool_names = [t[0] for t in probed]
 
-    # Non-TTY: skip the checklist; same priority as the interactive pre-check.
+    # Non-TTY (or a web/API install, which has no human at the terminal):
+    # skip the curses checklist entirely. Priority matches the interactive
+    # pre-check: prior user selection > manifest default > all-on.
     import sys as _sys
-    if not _sys.stdin.isatty():
-        preferred = prior_selection if prior_selection is not None else (entry.tools.default_enabled or None)
-        _write_tools_filter(
-            name, "include", None if preferred is None else [n for n in preferred if n in tool_names]
-        )
+    if non_interactive or not _sys.stdin.isatty():
+        if prior_selection is not None:
+            include = [n for n in prior_selection if n in tool_names]
+        elif entry.tools.default_enabled:
+            include = [n for n in entry.tools.default_enabled if n in tool_names]
+        else:
+            include = None
+        _write_tools_filter(name, "include", include)
         return
 
     # A prior ``include: []`` (user chose zero tools) outranks manifest defaults, like the non-TTY path.
@@ -741,12 +764,19 @@ def recorded_catalog_install(name: str) -> Iterator[None]:
         record_mcp_install("catalog", name, "success")
 
 
-def install_entry(entry: CatalogEntry, *, enable: bool = True, preloaded_env: Optional[Dict[str, str]] = None) -> None:
+def install_entry(
+    entry: CatalogEntry, *, enable: bool = True, preloaded_env: Optional[Dict[str, str]] = None,
+    non_interactive: bool = False,
+) -> None:
     with recorded_catalog_install(entry.name):
-        _install_entry(entry, enable=enable, preloaded_env=preloaded_env)
+        _install_entry(
+            entry, enable=enable, preloaded_env=preloaded_env, non_interactive=non_interactive)
 
 
-def _install_entry(entry: CatalogEntry, *, enable: bool, preloaded_env: Optional[Dict[str, str]]) -> None:
+def _install_entry(
+    entry: CatalogEntry, *, enable: bool, preloaded_env: Optional[Dict[str, str]],
+    non_interactive: bool = False,
+) -> None:
     """Install a catalog entry end-to-end.
 
     Order: git clone + bootstrap (if any); credential prompts (``auth.env``) to .env; write
@@ -770,7 +800,8 @@ def _install_entry(entry: CatalogEntry, *, enable: bool, preloaded_env: Optional
     if entry.auth.env:
         print()
         _say("  Configure credentials:", Colors.CYAN)
-        env_values = _prompt_env_vars(entry.auth.env, preloaded_env or {})
+        env_values = _prompt_env_vars(
+            entry.auth.env, preloaded_env or {}, non_interactive=non_interactive)
     if entry.auth.type == "oauth" and entry.auth.provider:
         # Provider-mediated OAuth relies on the existing `hermes auth <provider>` flow; surface
         # guidance rather than auto-running it to keep install decoupled from provider-auth lifecycle.
@@ -803,7 +834,13 @@ def _install_entry(entry: CatalogEntry, *, enable: bool, preloaded_env: Optional
     if not _save_mcp_server(entry.name, server_cfg):
         raise CatalogError(f"catalog entry '{entry.name}' rejected: suspicious command/args configuration")
 
-    _apply_tool_selection(entry, prior_selection=prior_selection, prior_exclude=prior_exclude)
+    # ── Probe + tool selection ──────────────────────────────────────────
+    _apply_tool_selection(
+        entry,
+        prior_selection=prior_selection,
+        prior_exclude=prior_exclude,
+        non_interactive=non_interactive,
+    )
 
     print()
     _say(
