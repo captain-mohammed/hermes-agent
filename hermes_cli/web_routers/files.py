@@ -8,6 +8,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import gzip
 import mimetypes
 import os
 import re
@@ -430,7 +431,10 @@ def _managed_file_response(
     _policy, target, _display_path, max_bytes, mime_type = _managed_readable_file(request, path)
     if media_only and target.suffix.lower() not in _STREAMABLE_MEDIA_EXTENSIONS:
         raise HTTPException(status_code=415, detail="Unsupported media type")
-    _managed_file_size(target, max_bytes)
+    # No upload-style size cap here: the file is already on disk (the agent
+    # pipeline read it), and server-decompressed originals can legitimately
+    # exceed the 100 MB transport cap — blocking the download would strand
+    # files the agent already worked with.
     return FileResponse(
         path=str(target),
         media_type=mime_type,
@@ -542,24 +546,102 @@ async def stream_upload_to_path(
     return total
 
 
+def _looks_like_gzip(path: Path) -> bool:
+    """True when the file starts with the gzip magic bytes (0x1f 0x8b)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == bytes([0x1F, 0x8B])
+    except OSError:
+        return False
+
+
+def _decompress_gzip_to(src: Path, dst: Path, max_bytes: int) -> None:
+    """Stream-decompress a gzip file into place, enforcing a byte cap.
+
+    Reads decompressed chunks (not compressed ones), so a "decompression
+    bomb" is bounded by ``max_bytes`` rather than by the on-wire size.
+    Raises HTTPException(413) when the decompressed content exceeds the cap;
+    the caller is responsible for cleaning up a partially written ``dst``.
+    """
+    from hermes_cli.web_server import _UPLOAD_CHUNK_BYTES
+
+    total = 0
+    try:
+        with gzip.open(src, "rb") as fin, open(dst, "wb") as fout:
+            while True:
+                chunk = fin.read(_UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(status_code=413, detail="Decompressed file is too large")
+                fout.write(chunk)
+    except HTTPException:
+        dst.unlink(missing_ok=True)
+        raise
+    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+        # Corrupt/truncated gzip — surface as a clean client error instead of
+        # leaving a half-written file behind.
+        dst.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Uploaded gzip could not be decompressed: {exc}")
+
+
 @router.post("/api/files/upload-stream")
 async def upload_managed_file_stream(
     request: Request,
     file: UploadFile = File(...),
     path: str = Form(...),
     overwrite: bool = Form(True),
+    decompress: bool = Form(False),
+    original_size: int = Form(0),
 ):
     """Chunked multipart upload: constant memory and no base64 inflation, unlike
-    the JSON data-URL endpoint that trips proxy body-size limits on large archives."""
+    the JSON data-URL endpoint that trips proxy body-size limits on large archives.
+
+    Transport-only compression: with ``decompress=1`` and gzip magic bytes on
+    disk, the upload is stream-decompressed before it lands — the client
+    gzipped an oversized file to fit the transport cap, and the agent must
+    always read the original bytes under the original name. The decompressed
+    expansion is bounded by ``original_size`` (decompression-bomb guard);
+    non-gzip bodies under decompress=1 are stored as-is — the flag is a hint,
+    the magic check decides.
+    """
+    from hermes_cli.web_server import _MANAGED_FILE_MAX_BYTES
+
     policy, target, display_path = _managed_write_target(path, request, overwrite)
     with _io_errors("File is not writable", "Could not create parent directory"):
         target.parent.mkdir(parents=True, exist_ok=True)
-    await stream_upload_to_path(
-        file, target,
-        too_large="File is too large",
-        not_writable="File is not writable",
-        write_failed="Could not write file",
-    )
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".upload", dir=str(target.parent))
+    tmp_path = Path(tmp_name)
+    renamed = False
+    try:
+        with os.fdopen(tmp_fd, "wb") as out:
+            total = 0
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MANAGED_FILE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="File is too large")
+                out.write(chunk)
+        if decompress and _looks_like_gzip(tmp_path):
+            cap = max(original_size, _MANAGED_FILE_MAX_BYTES)
+            _decompress_gzip_to(tmp_path, target, cap)
+            renamed = True
+        else:
+            os.replace(tmp_path, target)
+            renamed = True
+    except HTTPException:
+        raise
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="File is not writable")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
+    finally:
+        if not renamed:
+            tmp_path.unlink(missing_ok=True)
+        await file.close()
     return _managed_write_result(policy, target, display_path)
 
 

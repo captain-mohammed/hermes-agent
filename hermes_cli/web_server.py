@@ -30,7 +30,7 @@ import urllib.parse
 from hermes_cli.install_identity import get_install_id as _shared_get_install_id
 from hermes_cli.pty_session import run_reaper
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
