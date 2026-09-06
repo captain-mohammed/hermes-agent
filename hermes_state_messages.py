@@ -1140,3 +1140,101 @@ class SessionMessagesMixin:
         if affected_ids:
             logger.info("Permanently cleared %d stale tool-call marker row(s) in state.db (#78148)", len(affected_ids))
         return _result(affected_ids, backup_path)
+
+
+    #: Key under which produced-file attachments live inside
+    #: ``display_metadata`` (agent deliverables the dashboard renders as
+    #: downloadable chips in the assistant bubble). Shares the per-message
+    #: JSON column so they survive rewind/compaction row rewrites.
+    ATTACHMENTS_METADATA_KEY = "attachments"
+
+    def set_message_attachments(
+        self,
+        session_id: str,
+        message_id,
+        attachments: Optional[List[Dict[str, Any]]],
+    ) -> bool:
+        """Store produced-file attachment descriptors on one assistant message.
+
+        ``attachments`` is a list of ``{name, path, size, mime_type}`` dicts
+        (agent-produced files copied under the managed files root). They live
+        inside the existing ``display_metadata`` JSON column so they survive
+        rewind/compaction row rewrites; ``get_messages`` already decodes that
+        column, so restored sessions render the same download chips. An empty
+        list clears the key. Returns True when the row was found.
+        """
+        def _do(conn):
+            row = conn.execute(
+                "SELECT display_metadata FROM messages WHERE id = ? AND session_id = ?",
+                (message_id, session_id),
+            ).fetchone()
+            if row is None:
+                return False
+            meta = self._decode_display_metadata(row[0]) or {}
+            if attachments:
+                meta[self.ATTACHMENTS_METADATA_KEY] = attachments
+            else:
+                meta.pop(self.ATTACHMENTS_METADATA_KEY, None)
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (self._encode_display_metadata(meta) if meta else None, message_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    #: Key under which the per-run token usage breakdown lives inside
+    #: ``display_metadata`` (input/output/cache read/cache write/reasoning
+    #: tokens + estimated cost). Same column as attachments/reactions so the
+    #: breakdown survives rewind/compaction row rewrites, and ``get_messages``
+    #: already decodes the column so restored sessions show the full usage.
+    USAGE_METADATA_KEY = "usage"
+
+    def set_message_usage(
+        self,
+        session_id: str,
+        message_id,
+        usage: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Store the per-run token usage breakdown on one assistant message.
+
+        ``usage`` is a dict of {input_tokens, output_tokens, cache_read_tokens,
+        cache_write_tokens, reasoning_tokens, estimated_cost_usd, total_tokens}
+        values (only keys present are written). It lives inside the existing
+        ``display_metadata`` JSON column so it survives rewind/compaction row
+        rewrites, mirroring ``set_message_attachments``. A falsy/empty dict
+        clears the key. Returns True when the row was found.
+        """
+        def _do(conn):
+            row = conn.execute(
+                "SELECT display_metadata FROM messages WHERE id = ? AND session_id = ?",
+                (message_id, session_id),
+            ).fetchone()
+            if row is None:
+                return False
+            meta = self._decode_display_metadata(row[0]) or {}
+            if usage:
+                meta[self.USAGE_METADATA_KEY] = {
+                    k: v
+                    for k, v in usage.items()
+                    if k in (
+                        "input_tokens", "output_tokens", "cache_read_tokens",
+                        "cache_write_tokens", "reasoning_tokens",
+                        "estimated_cost_usd", "total_tokens",
+                    )
+                    and v is not None
+                }
+            else:
+                meta.pop(self.USAGE_METADATA_KEY, None)
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (self._encode_display_metadata(meta) if meta else None, message_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    #: Key under which message reactions live inside ``display_metadata``.
+    #: Reactions share the existing per-message JSON column rather than a side
+    #: table so they survive rewind/compaction row rewrites with the row itself.
+    REACTIONS_METADATA_KEY = "reactions"

@@ -251,6 +251,77 @@ def _is_compression_edge(child: dict, parent: dict) -> bool:
         and started_at >= parent_ended_at)
 
 
+@list_router.get("/api/sessions/model-usage")
+def get_sessions_model_usage(
+    ids: str = None,
+    profile: Optional[str] = None,
+):
+    """Per-(session, model) token breakdown for the sessions list.
+
+    Aggregates ``session_model_usage`` rows grouped by (session_id, model),
+    folding billing-provider/base-url variants of the same model together so
+    the split lines up with the sessions-table totals the cards already show.
+    Only main-conversation rows (``task = ''``) are included — auxiliary
+    calls (title generation, approval checks, vision taps) are tracked in the
+    same table under their task name and would inflate the split without
+    representing what the user's conversation consumed.
+
+    ``ids`` optionally scopes to a comma-separated session id list (the
+    dashboard sends the ids of the current list page); without it every
+    session that has usage rows is returned.
+    """
+    id_filter: Optional[List[str]] = None
+    if ids:
+        id_filter = [s.strip() for s in ids.split(",") if s.strip()]
+        if not id_filter:
+            id_filter = None
+    try:
+        db = _open_session_db_for_profile(profile, read_only=True)
+        try:
+            params: List[Any] = []
+            where = ""
+            if id_filter:
+                where = f"WHERE u.session_id IN ({','.join('?' * len(id_filter))})"
+                params = list(id_filter)
+            cur = db._conn.execute(
+                f"""
+                SELECT u.session_id,
+                       u.model,
+                       SUM(u.input_tokens) as input_tokens,
+                       SUM(u.output_tokens) as output_tokens,
+                       SUM(u.cache_read_tokens) as cache_read_tokens,
+                       SUM(u.cache_write_tokens) as cache_write_tokens,
+                       SUM(u.reasoning_tokens) as reasoning_tokens
+                FROM session_model_usage u
+                {where}
+                GROUP BY u.session_id, u.model
+                ORDER BY u.session_id, SUM(u.input_tokens) + SUM(u.output_tokens) + SUM(u.cache_read_tokens) + SUM(u.cache_write_tokens) + SUM(u.reasoning_tokens) DESC
+                """,
+                params,
+            )
+            usage: Dict[str, List[Dict[str, Any]]] = {}
+            for r in cur.fetchall():
+                row = dict(r)
+                usage.setdefault(row.pop("session_id"), []).append(row)
+            return {"usage": usage}
+        finally:
+            db.close()
+    except sqlite3.OperationalError as exc:
+        _log.exception("GET /api/sessions/model-usage failed")
+        transient = is_transient_sqlite_error(exc)
+        raise HTTPException(
+            status_code=503 if transient else 500,
+            detail=(
+                "Session store is busy (disk I/O or lock). Retry."
+                if transient
+                else "Internal server error"
+            ),
+        ) from exc
+    except Exception:
+        _log.exception("GET /api/sessions/model-usage failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @search_router.get("/api/sessions/search")
 async def search_sessions(
     q: str = "", limit: int = 20, profile: Optional[str] = None, source: str = None,

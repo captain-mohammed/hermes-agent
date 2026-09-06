@@ -33,6 +33,13 @@ from typing import Any, Dict, List, Optional
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
 
+# One-shot latch: the server-side mojibake migration runs at most once per
+# process, no matter how many times the api_server adapter reconnects.
+_MOJIBAKE_MIGRATION_DONE = False
+# Last migration report line (or None before the first run) — surfaced via
+# /health/detailed so dashboards can show the server-side cleanup state.
+_MOJIBAKE_MIGRATION_REPORT: Optional[str] = None
+
 
 def _prefix_names_served_profile(profile: str) -> bool:
     """True when a /p/<profile>/ prefix names the profile this gateway serves. Fail closed: a
@@ -2371,8 +2378,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "gateway_drainable": derive_gateway_drainable(
                 gateway_running=True, gateway_state=gw_state),
             "exit_reason": runtime.get("exit_reason"),
-            # Contract: RFC3339 string | null, never a number (legacy epoch floats exist).
-            "updated_at": normalize_updated_at(runtime.get("updated_at")), "pid": os.getpid()})
+            # Contract: updated_at is RFC3339 string | null, never a number —
+            # the state file may carry legacy epoch floats or hand-edited junk.
+            "updated_at": normalize_updated_at(runtime.get("updated_at")),
+            "pid": os.getpid(),
+            # Neon/state-backend signal for remote dashboards: mirrors the
+            # dashboard's config view (HERMES_POSTGRES_URL env →
+            # hermes.postgres_url). Served here so a hosted app can confirm
+            # Neon through the gateway tunnel (this endpoint is authenticated
+            # by the API key and CORS-open to the dashboard origin), even
+            # though the dashboard gates its /api/config to proxied origins.
+            "postgres_configured": bool((os.environ.get("HERMES_POSTGRES_URL") or "").strip()),
+            # Server-side mojibake repair (one-shot per process): report line
+            # describing what the boot scan cleaned, or null before first run.
+            "mojibake_migration": _MOJIBAKE_MIGRATION_REPORT,
+        })
 
     @_require_auth
     async def _handle_models(self, request: "web.Request") -> "web.Response":
@@ -4057,6 +4077,46 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return False
         return True
 
+    async def _run_mojibake_migration(self) -> None:
+        """Run the one-time server-side mojibake repair off the event loop.
+
+        Marker-gated and idempotent: on an already-clean store the scan costs
+        a few seconds; when repairs do land, the report goes to the log so the
+        cleanup is observable. Any failure is logged and swallowed — this must
+        never block or break gateway boot."""
+        global _MOJIBAKE_MIGRATION_DONE
+        if _MOJIBAKE_MIGRATION_DONE:
+            return
+        _MOJIBAKE_MIGRATION_DONE = True
+        try:
+            await asyncio.to_thread(self._sync_mojibake_migration)
+        except Exception as exc:  # pragma: no cover — belt and braces
+            logger.warning("[%s] mojibake migration skipped: %s", self.name, exc)
+
+    def _sync_mojibake_migration(self) -> None:
+        global _MOJIBAKE_MIGRATION_REPORT
+        try:
+            from mojibake_repair import run_server_mojibake_migration
+        except ImportError:
+            logger.info(
+                "[%s] mojibake_repair module not importable — skipping "
+                "server-side text repair", self.name,
+            )
+            return
+        try:
+            report = run_server_mojibake_migration()
+            _MOJIBAKE_MIGRATION_REPORT = report.as_line()
+            if report.repaired_strings or report.repaired_files:
+                logger.warning(
+                    "[%s] %s", self.name, report.as_line(),
+                )
+            else:
+                logger.info(
+                    "[%s] mojibake scan clean: %s", self.name, report.as_line(),
+                )
+        except Exception as exc:
+            logger.warning("[%s] mojibake migration failed: %s", self.name, exc)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp web server."""
         if not AIOHTTP_AVAILABLE:
@@ -4084,6 +4144,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "`/platform resume api_server`.",
                 retryable=False)
             return False
+
+        # One-time server-side mojibake repair (mirror of the Stash OS
+        # frontend pass): marker-gated cp1252->utf8 decode over chat
+        # transcripts (SQLite + Postgres mirror) and memory/skill files.
+        # Idempotent — a clean store costs one scan pass. Never fatal.
+        await self._run_mojibake_migration()
+
         try:
             mws = [mw for mw in (
                 self._make_profile_prefix_middleware(), cors_middleware, body_limit_middleware,

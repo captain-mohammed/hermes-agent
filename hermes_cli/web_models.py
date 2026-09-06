@@ -94,6 +94,44 @@ class ManagedFileDelete(BaseModel):
     path: str
     recursive: bool = False
 
+
+class ModelOverrideEntry(BaseModel):
+    """One per-model catalog override — the canonical schema consumers accept.
+
+    Only the fields the user sets are sent; omitted fields leave the catalog
+    value untouched (partial patch semantics, matching agent/models_dev.py).
+    """
+    context_window: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    supports_tools: Optional[bool] = None
+    supports_vision: Optional[bool] = None
+    supports_reasoning: Optional[bool] = None
+    model_family: Optional[str] = None
+
+
+class ModelOverrideUpsert(BaseModel):
+    """Payload for POST /api/model/overrides — set one model's override.
+
+    ``provider`` accepts a Hermes provider id or a models.dev id. An entry
+    whose fields are all None/unset REMOVES the override (back to catalog).
+    """
+    provider: str
+    model: str
+    overrides: ModelOverrideEntry
+    profile: Optional[str] = None
+
+
+class ModelOverrideDelete(BaseModel):
+    """Payload for DELETE /api/model/overrides — drop one or all overrides.
+
+    ``model`` empty removes the provider's whole override section (including
+    its ``_default``); ``provider`` also empty clears every override.
+    """
+    provider: str = ""
+    model: str = ""
+    profile: Optional[str] = None
+
+
 class ModelAssignment(BaseModel):
     """POST /api/model/set — assign a provider/model to a slot.
 
