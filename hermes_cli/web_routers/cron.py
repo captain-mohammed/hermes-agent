@@ -24,6 +24,139 @@ from hermes_cli.web_routers._common import log as _log
 
 router = APIRouter()
 
+# ---- Executions ledger + incidents store (cron/executions.db) ----
+# These two tables share one profile-local database, but the cron.executions /
+# cron.incidents modules key their connection off process-global overrides and
+# get_hermes_home() — not off the profile a dashboard query targets. So the
+# dashboard endpoints open the *profile's* DB directly with the same ledger
+# helpers, mirroring the write-side semantics (states, redaction, dedup keys)
+# without mutating those globals.
+
+_INCIDENT_STATES = ("detected", "alerted", "closed")
+
+
+def _open_cron_ledger_for_profile(profile: Optional[str]):
+    """Open (and initialize) the executions/incidents DB for ``profile``."""
+    from cron.executions import open_ledger, prepare_ledger
+
+    _profile_name, home = _cron_profile_home(profile)
+    conn = open_ledger(home / "cron" / "executions.db")
+    prepare_ledger(conn, db_label="cron/executions.db (dashboard)")
+    # The scheduler creates these tables lazily on its first write; a read-only
+    # dashboard query must not 500 on a profile whose DB only has one side yet,
+    # so ensure both schemas exist. Reusing the modules' own initializers keeps
+    # the DDL in exactly one place.
+    from cron.executions import _initialize_schema as _init_executions
+    from cron.incidents import _initialize_schema as _init_incidents
+
+    _init_executions(conn)
+    _init_incidents(conn)
+    return conn
+
+
+def _list_executions_sync(job_id: Optional[str], profile: Optional[str], limit: int, status: Optional[str]):
+    limit_n = max(1, min(limit, 500))
+    clauses, params = [], []
+    if job_id:
+        clauses.append("job_id=?")
+        params.append(str(job_id))
+    if status:
+        clauses.append("status=?")
+        params.append(str(status))
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit_n)
+    conn = _open_cron_ledger_for_profile(profile)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM executions" + where + " ORDER BY claimed_at DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"executions": [dict(r) for r in rows], "limit": limit_n}
+
+
+def _execution_rollups_sync(job_ids: List[str], profile: Optional[str]):
+    """Per-job execution rollups: status counts + last outcome, one query."""
+    rollups: Dict[str, Dict[str, Any]] = {}
+    if not job_ids:
+        return rollups
+    conn = _open_cron_ledger_for_profile(profile)
+    try:
+        for job_id in job_ids:
+            rows = conn.execute(
+                """SELECT status, COUNT(*) AS n FROM executions
+                   WHERE job_id=? GROUP BY status""",
+                (str(job_id),),
+            ).fetchall()
+            last = conn.execute(
+                """SELECT status, finished_at, error FROM executions
+                   WHERE job_id=? ORDER BY claimed_at DESC, id DESC LIMIT 1""",
+                (str(job_id),),
+            ).fetchone()
+            counts: Dict[str, int] = {}
+            for r in rows:
+                counts[str(r["status"])] = int(r["n"])
+            rollups[str(job_id)] = {
+                "counts": counts,
+                "last": dict(last) if last is not None else None,
+            }
+    finally:
+        conn.close()
+    return rollups
+
+
+def _list_incidents_sync(profile: Optional[str], state: Optional[str], limit: int):
+    if state is not None and state not in _INCIDENT_STATES:
+        raise HTTPException(status_code=422, detail=f"state must be one of {list(_INCIDENT_STATES)}")
+    limit_n = max(1, min(limit, 200))
+    where, params = ("", []) if state is None else (" WHERE state=?", [state])
+    params.append(limit_n)
+    conn = _open_cron_ledger_for_profile(profile)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM cron_incidents" + where + " ORDER BY last_seen_at DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"incidents": [dict(r) for r in rows], "limit": limit_n}
+
+
+def _set_incident_state_sync(incident_id: str, state: str, profile: Optional[str]):
+    """Acknowledge (close) or alert an incident, mirroring incidents.set_incident_state
+    (including the 'closed is terminal' rule) against the profile DB."""
+    if state not in _INCIDENT_STATES:
+        raise HTTPException(status_code=422, detail=f"state must be one of {list(_INCIDENT_STATES)}")
+    from hermes_time import now as _hermes_now
+
+    conn = _open_cron_ledger_for_profile(profile)
+    try:
+        row = conn.execute(
+            "SELECT state FROM cron_incidents WHERE id=?", (str(incident_id),)
+        ).fetchone()
+        if row is None:
+            raise _job_not_found()
+        if row["state"] in (state, "closed"):
+            return {"ok": True, "changed": False}
+        now = _hermes_now().isoformat()
+        if state == "closed":
+            conn.execute(
+                """UPDATE cron_incidents
+                   SET state='closed', closed_at=?, acked_at=?
+                   WHERE id=? AND state != 'closed'""",
+                (now, now, str(incident_id)),
+            )
+        else:
+            conn.execute(
+                "UPDATE cron_incidents SET state=? WHERE id=?",
+                (state, str(incident_id)),
+            )
+        conn.commit()
+        return {"ok": True, "changed": True}
+    finally:
+        conn.close()
+
 _find_cron_job_profile = late("_find_cron_job_profile", "hermes_cli.web_server_cron")
 _fire_cron_job_for_profile = late("_fire_cron_job_for_profile", "hermes_cli.web_server_cron")
 _forward_cron_fire_to_gateway = late("_forward_cron_fire_to_gateway", "hermes_cli.web_server_cron")
@@ -266,6 +399,57 @@ async def trigger_cron_job(job_id: str, profile: Optional[str] = None):
 @router.delete("/api/cron/jobs/{job_id}")
 async def delete_cron_job(job_id: str, profile: Optional[str] = None):
     return await _run_cron_dashboard_io(_delete_cron_job_sync, job_id, profile)
+
+
+@router.get("/api/cron/executions")
+async def list_cron_executions(
+    profile: Optional[str] = None,
+    job_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    """Execution attempts from the profile's ledger, newest first."""
+    return await _run_cron_dashboard_io(
+        _list_executions_sync, job_id, profile, limit, status
+    )
+
+
+@router.get("/api/cron/execution-rollups")
+async def cron_execution_rollups(profile: Optional[str] = None, job_id: Optional[str] = None):
+    """Per-job status counts + last outcome for the listed job ids (comma-
+    separated) or all jobs in the profile."""
+    ids: List[str]
+    if job_id:
+        ids = [j.strip() for j in str(job_id).split(",") if j.strip()]
+    else:
+        try:
+            jobs = await _run_cron_dashboard_io(_list_cron_jobs_sync, profile or "all")
+        except Exception:
+            jobs = []
+        ids = [str(j.get("id")) for j in (jobs or []) if j.get("id")]
+    return await _run_cron_dashboard_io(_execution_rollups_sync, ids, profile)
+
+
+@router.get("/api/cron/incidents")
+async def list_cron_incidents(
+    profile: Optional[str] = None,
+    state: Optional[str] = None,
+    limit: int = 50,
+):
+    """Deduped job failures (newest activity first) from the profile's store."""
+    return await _run_cron_dashboard_io(_list_incidents_sync, profile, state, limit)
+
+
+@router.post("/api/cron/incidents/{incident_id}/{action}")
+async def cron_incident_action(
+    incident_id: str,
+    action: str,
+    profile: Optional[str] = None,
+):
+    """Acknowledge an incident (``action=ack`` → terminal close)."""
+    if action != "ack":
+        raise HTTPException(status_code=404, detail=f"Unknown incident action: {action}")
+    return await _run_cron_dashboard_io(_set_incident_state_sync, incident_id, "closed", profile)
 
 
 @router.post("/api/cron/fire")
