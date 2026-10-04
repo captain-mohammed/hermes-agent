@@ -389,7 +389,7 @@ def test_stream_upload_decompress_flag_non_gzip_stored_raw(forced_files_client):
 def test_decompress_gzip_to_enforces_cap(tmp_path):
     """Decompression is bounded by max_bytes so a tiny upload can't expand
     into a disk-filling bomb."""
-    from hermes_cli.web_server import _decompress_gzip_to
+    from hermes_cli.web_routers.files import _decompress_gzip_to
 
     src = tmp_path / "in.gz"
     dst = tmp_path / "out.bin"
@@ -404,7 +404,7 @@ def test_decompress_gzip_to_enforces_cap(tmp_path):
 def test_decompress_gzip_to_rejects_corrupt(tmp_path):
     """Truncated/corrupt gzip surfaces as a 400 and never leaves a partial
     file behind."""
-    from hermes_cli.web_server import _decompress_gzip_to
+    from hermes_cli.web_routers.files import _decompress_gzip_to
 
     src = tmp_path / "in.gz"
     dst = tmp_path / "out.bin"

@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import os
 import platform
-import pwd
 import subprocess
 from pathlib import Path
 
 import pytest
+
+# ``pwd`` is POSIX-only (launchd/systemd account homes). Production code imports
+# it lazily behind platform checks; skip this module where it does not exist
+# instead of failing collection on Windows.
+pwd = pytest.importorskip("pwd")
 
 from hermes_cli import gateway, profiles
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override

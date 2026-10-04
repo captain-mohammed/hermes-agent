@@ -651,7 +651,24 @@ async def upload_managed_file(payload: ManagedFileUpload, request: Request):
     data, _mime_type = _decode_data_url(payload.data_url)
     with _io_errors("File is not writable", "Could not write file"):
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+        # Transport-only compression (parity with upload-stream): when the
+        # client gzipped the bytes for transport and says so, store the
+        # ORIGINAL content under the original name. ``original_size`` bounds
+        # the decompression-bomb expansion.
+        if payload.decompress and data[:2] == b"\x1f\x8b":
+            from hermes_cli.web_server import _MANAGED_FILE_MAX_BYTES
+            cap = max(payload.original_size, _MANAGED_FILE_MAX_BYTES)
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".upload", dir=str(target.parent))
+            tmp_path = Path(tmp_name)
+            with os.fdopen(tmp_fd, "wb") as out:
+                out.write(data)
+            try:
+                _decompress_gzip_to(tmp_path, target, cap)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        else:
+            target.write_bytes(data)
     return _managed_write_result(policy, target, display_path)
 
 
