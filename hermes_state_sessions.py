@@ -961,6 +961,25 @@ class SessionSessionsMixin:
             WHERE id IN (SELECT id FROM lineage) AND archived <> 0
             """, params).rowcount > 0
 
+    def set_session_reasoning_prefs(
+        self, session_id: str, reasoning_effort: Optional[str] = None,
+        show_reasoning: Optional[bool] = None,
+    ) -> bool:
+        """Persist per-session reasoning prefs into their dedicated columns.
+
+        ``None`` leaves a value untouched; a blank effort clears to NULL (inherit
+        the global default). Propagated across the compression lineage like
+        archived/pinned, so a continuation session keeps the caller's choice.
+        """
+        changed = False
+        if reasoning_effort is not None:
+            changed |= self._set_lineage_column(
+                "reasoning_effort", session_id, reasoning_effort.strip() or None)
+        if show_reasoning is not None:
+            changed |= self._set_lineage_column(
+                "show_reasoning", session_id, int(show_reasoning))
+        return changed
+
     # Accidental end reasons recovery treats as resumable (also interpolated into
     # the recovery/promotion SQL so literals cannot drift).
     RECOVERABLE_END_REASONS = _RECOVERABLE_END_REASONS
