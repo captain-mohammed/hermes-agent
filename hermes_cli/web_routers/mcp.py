@@ -560,7 +560,7 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
     # successful probe must NOT drop into the curses tool-selection checklist
     # (which would block forever on stdin).
     try:
-await scoped_to_thread(
+        await scoped_to_thread(
             effective_profile,
             lambda: mcp_catalog.install_entry(
                 entry,
